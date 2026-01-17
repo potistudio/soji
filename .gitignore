@@ -1,0 +1,7 @@
+# macOS dummy files
+.DS_Store
+Thumbs.db
+
+# Cargo artifacts
+/target
+Cargo.lock
