@@ -2,12 +2,13 @@ use anyhow::Result;
 use colored::*;
 use crossterm::{
     cursor, execute,
-    style::{Color, Print, ResetColor, SetForegroundColor},
+    style::{Color, ResetColor, SetForegroundColor},
     terminal::{Clear, ClearType},
 };
+use is_elevated::is_elevated;
 use rand::Rng;
 use rand::seq::SliceRandom;
-use std::io::{Write, stdout};
+use std::io::{Write, stdout}; // Removed stdin, Command
 use std::thread;
 use std::time::Duration;
 
@@ -21,9 +22,6 @@ const BANNER: &str = r#"
 const CANVAS_WIDTH: u16 = 39;
 const CANVAS_HEIGHT: u16 = 10;
 const DUST_DENSITY: f32 = 0.2;
-
-const UPDATE_INTERVAL_MS: u64 = 50;
-const CLEANING_STEPS: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Particle {
@@ -87,7 +85,7 @@ impl Canvas {
             let num_to_purify = current_count - target_count;
 
             // Mark the first N particles as purifying
-            // Since the vector is unsorted (random order), this picks random particles.
+            // Since they are sorted Top-to-Bottom (random in row), this cleans row by row.
             for i in 0..num_to_purify {
                 if let Some(p) = self.particles.get_mut(i) {
                     p.is_purifying = true;
@@ -99,25 +97,30 @@ impl Canvas {
     fn draw(&self) -> Result<()> {
         let mut stdout = stdout();
 
-        // 1. Draw frame (background)
-        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
-        for y in 0..self.height {
-            execute!(stdout, cursor::MoveToColumn(0))?;
+        // --- Double Buffering ---
+        // Prepare the buffer with empty spaces and default color
+        // height x width grid of (char, color)
+        let mut buffer: Vec<Vec<(char, Color)>> =
+            vec![vec![(' ', Color::Reset); self.width as usize]; self.height as usize];
 
-            if y == 0 || y == self.height - 1 {
-                // Top and bottom borders
-                print!("+{}+", "-".repeat((self.width - 2) as usize));
-            } else {
-                // Side borders + clear content
-                print!("|{}|", " ".repeat((self.width - 2) as usize));
+        // 1. Draw Frame into buffer
+        // Note: Coordinates are (y, x) for the buffer
+        let border_color = Color::DarkGrey;
+        for y in 0..self.height as usize {
+            for x in 0..self.width as usize {
+                if y == 0 || y == (self.height - 1) as usize {
+                    if x == 0 || x == (self.width - 1) as usize {
+                        buffer[y][x] = ('+', border_color);
+                    } else {
+                        buffer[y][x] = ('-', border_color);
+                    }
+                } else if x == 0 || x == (self.width - 1) as usize {
+                    buffer[y][x] = ('|', border_color);
+                }
             }
-
-            println!();
         }
 
-        // 2. Draw dust particles
-        let mut current_color = Color::Reset; // Sentinel
-
+        // 2. Draw Dust Particles into buffer
         for p in &self.particles {
             let color = if p.is_purifying {
                 Color::White
@@ -125,18 +128,36 @@ impl Canvas {
                 Color::DarkYellow
             };
 
-            if color != current_color {
-                execute!(stdout, SetForegroundColor(color))?;
-                current_color = color;
+            // Safety check for bounds
+            if (p.y as usize) < self.height as usize && (p.x as usize) < self.width as usize {
+                buffer[p.y as usize][p.x as usize] = (p.char, color);
             }
+        }
 
-            execute!(
-                stdout,
-                cursor::MoveUp(self.height - p.y),
-                cursor::MoveToColumn(p.x),
-                Print(p.char),
-                cursor::MoveDown(self.height - p.y), // Return to bottom
-            )?;
+        // 3. Render Buffer to Stdout
+        // Move cursor to top-left of the canvas area
+        // We know the loop in main moves cursor UP by canvas.height before calling draw.
+        // So we start printing from there.
+
+        for row in buffer {
+            let mut last_color = Color::Reset; // Track color to minimize escape codes
+
+            // Optimization: Detect color changes or batch strings?
+            // Simple approach: Iterate chars.
+
+            // To prevent artifacting from previous line lengths if we were not using fixed width,
+            // but here we have fixed width box.
+
+            execute!(stdout, cursor::MoveToColumn(0))?;
+
+            for (ch, color) in row {
+                if color != last_color {
+                    execute!(stdout, SetForegroundColor(color))?;
+                    last_color = color;
+                }
+                print!("{}", ch);
+            }
+            println!(); // Next line
         }
 
         execute!(stdout, ResetColor)?;
@@ -168,6 +189,59 @@ fn main() -> Result<()> {
 
     println!("{}\n", BANNER.bright_cyan());
 
+    // 1. Check for Admin Privileges (Warn only)
+    if !is_elevated() {
+        println!(
+            "{}",
+            "Warning: Running without Administrator privileges.".yellow()
+        );
+        println!(
+            "{}",
+            "Some temporary files may not be deleted due to permissions.".yellow()
+        );
+        // Simple pause so user sees message
+        thread::sleep(Duration::from_secs(2));
+    }
+
+    // Calculate temp dir size and collect files
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let result = scan_temp_files();
+        let _ = tx.send(result);
+    });
+
+    let spinner_chars = ['|', '/', '-', '\\'];
+    let mut i = 0;
+
+    // Initial print to reserve line
+    print!("{} Analyzing...", "⠋".yellow());
+    stdout.flush()?;
+
+    let (files, total_size) = loop {
+        if let Ok(result) = rx.try_recv() {
+            // Clear the spinner line
+            print!("\r\x1b[2K");
+            stdout.flush()?;
+            break result?;
+        }
+
+        print!("\r{} Analyzing... {}", "⠋".yellow(), spinner_chars[i % 4]);
+        stdout.flush()?;
+        i += 1;
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    println!(
+        "Found temporary files: {}",
+        format_size(total_size).yellow()
+    );
+
+    // Safety check
+    if total_size == 0 {
+        println!("Nothing to clean.");
+        return Ok(());
+    }
+
     let mut canvas = Canvas::new(CANVAS_WIDTH, CANVAS_HEIGHT, DUST_DENSITY);
 
     // Reserve space for the canvas
@@ -175,8 +249,24 @@ fn main() -> Result<()> {
         println!();
     }
 
-    for i in 0..=CLEANING_STEPS {
-        let progress = i as f32 / CLEANING_STEPS as f32;
+    let mut cleaned_size = 0;
+    let mut processed_size = 0;
+
+    // Iterate over actual files to calculate progress
+    for file in files {
+        // Try to delete the file, ignore errors (e.g. permission denied)
+        if std::fs::remove_file(&file.path).is_ok() {
+            cleaned_size += file.size;
+        }
+
+        // Always increment processed size so the animation completes
+        processed_size += file.size;
+
+        // Simulation delay
+        thread::sleep(Duration::from_millis(5));
+
+        // Calculate progress based on real bytes processed (success+failed)
+        let progress = processed_size as f32 / total_size as f32;
 
         // Update logic
         canvas.update(progress);
@@ -193,11 +283,14 @@ fn main() -> Result<()> {
             cursor::MoveToColumn(0),
             SetForegroundColor(Color::Cyan)
         )?;
-        print!(" Cleaning... [{:.0}%]  ", progress * 100.0);
+        print!(
+            " Cleaning... [{:.0}%] {} / {}  ",
+            progress * 100.0,
+            format_size(cleaned_size),
+            format_size(total_size)
+        );
         execute!(stdout, ResetColor)?;
         stdout.flush()?;
-
-        thread::sleep(Duration::from_millis(UPDATE_INTERVAL_MS));
     }
 
     // Final cleanup: Remove the last purifying particles and draw empty canvas
@@ -211,11 +304,56 @@ fn main() -> Result<()> {
         cursor::MoveToColumn(0),
         SetForegroundColor(Color::Cyan)
     )?;
-    print!(" Cleaning... [100%]");
+    print!(" Cleaning... [100%] ({})", format_size(cleaned_size));
     execute!(stdout, ResetColor)?;
     stdout.flush()?;
     println!(); // Move past the status line
 
     println!("\nDone. The machine is clean.");
+
     Ok(())
+}
+
+struct FileInfo {
+    path: std::path::PathBuf,
+    size: u64,
+}
+
+fn scan_temp_files() -> Result<(Vec<FileInfo>, u64)> {
+    let temp_dir = std::env::temp_dir();
+    let mut files = Vec::new();
+    let mut total_size = 0;
+
+    for entry in walkdir::WalkDir::new(&temp_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if let Ok(metadata) = entry.metadata() {
+            if metadata.is_file() {
+                let size = metadata.len();
+                total_size += size;
+                files.push(FileInfo {
+                    path: entry.path().to_path_buf(),
+                    size,
+                });
+            }
+        }
+    }
+    Ok((files, total_size))
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
