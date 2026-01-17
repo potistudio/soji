@@ -1,3 +1,4 @@
+use anyhow::Result;
 use colored::*;
 use crossterm::{
     cursor, execute,
@@ -95,7 +96,7 @@ impl Canvas {
         }
     }
 
-    fn draw(&self) -> std::io::Result<()> {
+    fn draw(&self) -> Result<()> {
         let mut stdout = stdout();
 
         // 1. Draw frame (background)
@@ -151,7 +152,7 @@ impl Drop for CursorGuard {
     }
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<()> {
     let mut stdout = stdout();
 
     // Clear screen and show banner, hide cursor
